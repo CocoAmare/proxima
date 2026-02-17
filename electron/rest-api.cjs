@@ -8,6 +8,18 @@ const { URL } = require('url');
 const REST_PORT = parseInt(process.env.PROXIMA_REST_PORT) || 3210;
 const VERSION = '2.1.0';
 const API_PREFIX = '/v1';
+const crypto = require('crypto');
+
+// ─── Security ───────────────────────────────────────────
+// API key authentication — loaded from settings or auto-generated on first run
+let API_KEY = process.env.PROXIMA_API_KEY || null;
+// Allowed CORS origins — only localhost by default
+const ALLOWED_ORIGINS = new Set([
+    'http://localhost',
+    'http://127.0.0.1',
+    `http://localhost:${REST_PORT}`,
+    `http://127.0.0.1:${REST_PORT}`,
+]);
 
 // ─── Model Aliases ───────────────────────────────────────
 // Users can use any of these names to refer to a provider
@@ -94,6 +106,19 @@ function getFormattedStats() {
 function initRestAPI(config) {
     handleMCPRequest = config.handleMCPRequest;
     getEnabledProvidersList = config.getEnabledProviders;
+
+    // Load or generate API key
+    if (config.apiKey) {
+        API_KEY = config.apiKey;
+    } else if (!API_KEY) {
+        API_KEY = crypto.randomBytes(32).toString('hex');
+        console.log(`[API] Generated API key: ${API_KEY}`);
+        console.log('[API] Set PROXIMA_API_KEY env var or pass apiKey in settings to use a fixed key.');
+    }
+}
+
+function getAPIKey() {
+    return API_KEY;
 }
 
 // ─── Helpers ─────────────────────────────────────────────
@@ -116,22 +141,50 @@ function parseBody(req) {
     });
 }
 
-function sendJSON(res, code, data) {
-    res.writeHead(code, {
+function getCorsOrigin(req) {
+    const origin = req && req.headers && req.headers.origin;
+    if (!origin) return null; // Same-origin or non-browser — no CORS header needed
+    // Allow any localhost/127.0.0.1 origin regardless of port
+    try {
+        const url = new URL(origin);
+        if (url.hostname === 'localhost' || url.hostname === '127.0.0.1') {
+            return origin;
+        }
+    } catch (e) { /* invalid origin */ }
+    return null; // Deny cross-origin from non-localhost
+}
+
+function sendJSON(res, code, data, req) {
+    const headers = {
         'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
         'X-Powered-By': 'Proxima AI'
-    });
+    };
+    const corsOrigin = getCorsOrigin(req);
+    if (corsOrigin) {
+        headers['Access-Control-Allow-Origin'] = corsOrigin;
+        headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS';
+        headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization';
+        headers['Vary'] = 'Origin';
+    }
+    res.writeHead(code, headers);
     res.end(JSON.stringify(data, null, 2));
 }
 
-function sendError(res, code, msg, type = 'api_error') {
+function authenticateRequest(req) {
+    // API key can be passed as Bearer token or X-API-Key header
+    const authHeader = req.headers['authorization'] || '';
+    const apiKeyHeader = req.headers['x-api-key'] || '';
+    const bearer = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+    const key = bearer || apiKeyHeader;
+    if (!API_KEY) return true; // No key configured = open (backward compat)
+    return key === API_KEY;
+}
+
+function sendError(res, code, msg, type = 'api_error', req) {
     sendJSON(res, code, {
         error: { message: msg, type, code },
         timestamp: new Date().toISOString()
-    });
+    }, req);
 }
 
 function getEnabled() {
@@ -490,7 +543,7 @@ POST /v1/chat/completions
 }
 
 // ─── Route Handler ───────────────────────────────────────
-async function handleRoute(method, pathname, body, res) {
+async function handleRoute(method, pathname, body, res, req) {
 
     // Main endpoint — everything goes through here
     // The "function" field in the body determines what happens
@@ -500,23 +553,23 @@ async function handleRoute(method, pathname, body, res) {
         const resolved = resolveModels(modelInput);
 
         if (resolved.mode === 'error') {
-            return sendError(res, 404, resolved.error, 'model_not_found');
+            return sendError(res, 404, resolved.error, 'model_not_found', req);
         }
 
         // Helper: run prompt on resolved models
         async function run(prompt, defaultModel, extraFields = {}) {
             const input = body.model || defaultModel || 'auto';
             const r = resolveModels(input);
-            if (r.mode === 'error') return sendError(res, 404, r.error);
+            if (r.mode === 'error') return sendError(res, 404, r.error, 'model_not_found', req);
             try {
                 if (r.mode === 'single') {
                     const result = await queryProvider(r.providers[0], prompt);
-                    sendJSON(res, 200, { ...formatChatResponse(result, r.providers[0]), ...extraFields });
+                    sendJSON(res, 200, { ...formatChatResponse(result, r.providers[0]), ...extraFields }, req);
                 } else {
                     const multi = await queryMultiple(r.providers, prompt);
-                    sendJSON(res, 200, { ...formatAllResponse(multi), ...extraFields });
+                    sendJSON(res, 200, { ...formatAllResponse(multi), ...extraFields }, req);
                 }
-            } catch (e) { sendError(res, 500, e.message); }
+            } catch (e) { sendError(res, 500, e.message, 'api_error', req); }
         }
 
         // ── function: "search" ──
@@ -598,13 +651,13 @@ async function handleRoute(method, pathname, body, res) {
                 const result = body.file
                     ? await queryProviderWithFile(provider, message, body.file)
                     : await queryProvider(provider, message);
-                sendJSON(res, 200, formatChatResponse(result, provider));
+                sendJSON(res, 200, formatChatResponse(result, provider), req);
             } else {
                 const multiResults = await queryMultiple(resolved.providers, message);
-                sendJSON(res, 200, formatAllResponse(multiResults));
+                sendJSON(res, 200, formatAllResponse(multiResults), req);
             }
         } catch (e) {
-            sendError(res, 500, e.message);
+            sendError(res, 500, e.message, 'api_error', req);
         }
         return;
     }
@@ -626,7 +679,7 @@ async function handleRoute(method, pathname, body, res) {
             });
         });
         models.push({ id: 'auto', object: 'model', owned_by: 'proxima', description: 'Auto-picks best available model' });
-        sendJSON(res, 200, { object: 'list', data: models });
+        sendJSON(res, 200, { object: 'list', data: models }, req);
         return;
     }
 
@@ -844,7 +897,7 @@ async function handleRoute(method, pathname, body, res) {
 
     // Docs page
     if (method === 'GET' && (pathname === '/' || pathname === '/docs')) {
-        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Access-Control-Allow-Origin': '*' });
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end(getDocsPage());
         return;
     }
@@ -861,22 +914,34 @@ function startRestAPI() {
 
     httpServer = http.createServer(async (req, res) => {
         if (req.method === 'OPTIONS') {
-            res.writeHead(204, {
-                'Access-Control-Allow-Origin': '*',
+            const corsOrigin = getCorsOrigin(req);
+            const headers = {
                 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-                'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+                'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-API-Key',
                 'Access-Control-Max-Age': '86400'
-            });
+            };
+            if (corsOrigin) {
+                headers['Access-Control-Allow-Origin'] = corsOrigin;
+                headers['Vary'] = 'Origin';
+            }
+            res.writeHead(204, headers);
             return res.end();
         }
 
         const url = new URL(req.url, `http://localhost:${REST_PORT}`);
+
+        // Skip auth for docs page and health check
+        const isPublic = (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/docs'));
+        if (!isPublic && !authenticateRequest(req)) {
+            return sendError(res, 401, 'Invalid or missing API key. Pass via Authorization: Bearer <key> or X-API-Key header.', 'authentication_error', req);
+        }
+
         try {
             const body = req.method === 'POST' ? await parseBody(req) : {};
-            await handleRoute(req.method, url.pathname, body, res);
+            await handleRoute(req.method, url.pathname, body, res, req);
         } catch (err) {
             console.error('[API] Error:', err.message);
-            sendError(res, 500, err.message);
+            sendError(res, 500, err.message, 'api_error', req);
         }
     });
 
@@ -897,4 +962,4 @@ function startRestAPI() {
     return httpServer;
 }
 
-module.exports = { initRestAPI, startRestAPI };
+module.exports = { initRestAPI, startRestAPI, getAPIKey };

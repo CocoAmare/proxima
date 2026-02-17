@@ -237,6 +237,47 @@ No automated testing framework is configured. Testing is done manually through t
 2. Running `npm run mcp` and invoking tools via an MCP client
 3. Testing REST API endpoints with curl or the SDKs
 
+## Security Model
+
+### REST API Authentication
+
+The REST API requires an API key on all endpoints except the docs page (`/` and `/docs`).
+
+- **Auto-generated** on first run if not configured; printed to console on startup.
+- **Fixed key** via `PROXIMA_API_KEY` environment variable or `apiKey` in settings.
+- **Pass as** `Authorization: Bearer <key>` or `X-API-Key: <key>` header.
+
+### CORS Policy
+
+Cross-origin requests are only accepted from `localhost` / `127.0.0.1` origins. All other origins are silently denied (no `Access-Control-Allow-Origin` header). This prevents any external website from accessing the API via the browser.
+
+### IPC Authentication
+
+The IPC server (port 19222) uses a shared secret handshake:
+1. Electron writes a random secret to `<userData>/ipc-secret` (file mode `0600`).
+2. MCP server reads the secret on connect and sends `{"action":"auth","secret":"..."}`.
+3. Unauthenticated connections are rejected and disconnected.
+4. Override via `PROXIMA_IPC_SECRET` environment variable.
+
+### File Path Restrictions
+
+The `files` parameter and file analysis tools block reads from:
+- SSH keys, GPG keys, AWS/Azure/GCloud credentials
+- `.env` files, `.netrc`, `.npmrc`, `.pypirc`
+- Browser profile directories (prevents cookie theft)
+- Any file named `id_rsa`, `credentials.json`, `service-account.json`, etc.
+
+### Script Execution Guard
+
+The `executeScript` IPC command blocks scripts containing:
+`document.cookie`, `localStorage`, `sessionStorage`, `indexedDB`, `navigator.credentials`, `fetch(`, `XMLHttpRequest`, `window.open`, `eval(`
+
+### URL Validation
+
+- `openExternal` only allows `http:` and `https:` protocols (blocks `file:`, `smb:`, custom protocols).
+- `navigate` restricts URLs to known provider domains per provider.
+- Certificate error bypass uses exact domain suffix matching (not substring).
+
 ## Important Notes for AI Assistants
 
 - **No linter or formatter configured** -- follow existing code style (2-space indent, single quotes in JS, descriptive variable names).
@@ -245,6 +286,6 @@ No automated testing framework is configured. Testing is done manually through t
 - **Anti-detection is critical** -- the Electron app spoofs browser identity. Do not modify user-agent strings or automation flags without understanding the implications.
 - **Provider parsers are fragile** -- SSE response parsing in `browser-manager.cjs` is tightly coupled to each provider's API format. Changes to provider websites may break parsing.
 - **`enabled-providers.json` is gitignored** -- never commit user provider configurations.
-- **The `files` parameter** on MCP tools reads local files and attaches them to prompts. File type detection determines formatting (code blocks vs plain text).
-- **IPC protocol** -- MCP server communicates with Electron via raw TCP JSON messages on port 19222. Messages are newline-delimited JSON.
+- **The `files` parameter** on MCP tools reads local files and attaches them to prompts. File type detection determines formatting (code blocks vs plain text). Sensitive paths are blocked (see Security Model above).
+- **IPC protocol** -- MCP server communicates with Electron via raw TCP JSON messages on port 19222. Messages are newline-delimited JSON. Authentication is required (see Security Model above).
 - **Smart Router** (`smart_query` tool) auto-selects the best available provider with retry logic and fallback.

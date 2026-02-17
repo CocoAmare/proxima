@@ -4,8 +4,9 @@ const { app, BrowserWindow, ipcMain, shell, session } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const net = require('net');
+const crypto = require('crypto');
 const BrowserManager = require('./browser-manager.cjs');
-const { initRestAPI, startRestAPI } = require('./rest-api.cjs');
+const { initRestAPI, startRestAPI, getAPIKey } = require('./rest-api.cjs');
 
 // Anti-detection: must run before any Electron APIs
 // These MUST be set before app is ready or any windows are created
@@ -43,6 +44,18 @@ const enabledProvidersPath = path.join(userDataPath, 'enabled-providers.json');
 let mainWindow;
 let browserManager;
 let ipcServer; // For MCP server communication
+
+// IPC shared secret — written to a file that only the MCP server reads
+const IPC_SECRET = process.env.PROXIMA_IPC_SECRET || crypto.randomBytes(32).toString('hex');
+const ipcSecretPath = path.join(app.getPath('userData'), 'ipc-secret');
+
+function writeIPCSecret() {
+    try {
+        fs.writeFileSync(ipcSecretPath, IPC_SECRET, { mode: 0o600 });
+    } catch (e) {
+        console.error('[IPC] Failed to write IPC secret:', e.message);
+    }
+}
 
 // Default settings
 const defaultSettings = {
@@ -373,10 +386,13 @@ function startIPCServer() {
     const settings = loadSettings();
     const port = settings.ipcPort || 19222;
 
+    // Write IPC secret so MCP server can read it
+    writeIPCSecret();
+
     ipcServer = net.createServer((socket) => {
 
-
         let buffer = '';
+        let authenticated = false;
 
         socket.on('data', async (data) => {
             buffer += data.toString();
@@ -388,8 +404,22 @@ function startIPCServer() {
             for (const line of lines) {
                 if (line.trim()) {
                     try {
-
                         const request = JSON.parse(line);
+
+                        // First message must be auth handshake
+                        if (!authenticated) {
+                            if (request.action === 'auth' && request.secret === IPC_SECRET) {
+                                authenticated = true;
+                                socket.write(JSON.stringify({ success: true, requestId: request.requestId, message: 'authenticated' }) + '\n');
+                                continue;
+                            } else {
+                                console.error('[IPC] Unauthenticated connection rejected');
+                                socket.write(JSON.stringify({ error: 'Authentication required. Send {"action":"auth","secret":"<ipc-secret>"}', requestId: request.requestId }) + '\n');
+                                socket.destroy();
+                                return;
+                            }
+                        }
+
                         const response = await handleMCPRequest(request);
                         // IMPORTANT: Include requestId in response for MCP server to match!
                         response.requestId = request.requestId;
@@ -572,6 +602,19 @@ async function handleMCPRequest(request) {
                 return { success: true, provider, ready: buttonReady };
 
             case 'executeScript':
+                // Guard: only allow executeScript from internal callers (debugDOM is separate)
+                // Block scripts that attempt cookie/storage access
+                if (data.script && typeof data.script === 'string') {
+                    const dangerous = ['document.cookie', 'localStorage', 'sessionStorage',
+                        'indexedDB', 'navigator.credentials', 'fetch(', 'XMLHttpRequest',
+                        'window.open', 'eval('];
+                    const scriptLower = data.script.toLowerCase();
+                    const blocked = dangerous.find(d => scriptLower.includes(d.toLowerCase()));
+                    if (blocked) {
+                        console.error(`[Security] Blocked executeScript containing: ${blocked}`);
+                        return { success: false, error: `Script blocked: contains restricted API "${blocked}"` };
+                    }
+                }
                 const scriptResult = await browserManager.executeScript(provider, data.script);
                 return { success: true, provider, result: scriptResult };
 
@@ -2311,6 +2354,16 @@ ipcMain.handle('copy-to-clipboard', (event, text) => {
 });
 
 ipcMain.handle('open-external', (event, url) => {
+    // Only allow http/https URLs to prevent file://, smb://, and protocol handler abuse
+    try {
+        const parsed = new URL(url);
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+            console.error(`[Security] Blocked openExternal with unsafe protocol: ${parsed.protocol}`);
+            return { success: false, error: `Blocked: only http/https URLs allowed (got ${parsed.protocol})` };
+        }
+    } catch (e) {
+        return { success: false, error: 'Invalid URL' };
+    }
     shell.openExternal(url);
     return { success: true };
 });
@@ -2834,10 +2887,15 @@ app.on('activate', () => {
 
 // Handle certificate errors for some AI sites
 app.on('certificate-error', (event, webContents, url, error, certificate, callback) => {
-    // Only bypass for known AI provider domains
+    // Only bypass for known AI provider domains — use exact suffix matching
+    // to prevent evil-google.com from matching google.com
     const trustedDomains = ['perplexity.ai', 'openai.com', 'claude.ai', 'gemini.google.com', 'google.com'];
     const urlObj = new URL(url);
-    if (trustedDomains.some(domain => urlObj.hostname.includes(domain))) {
+    const hostname = urlObj.hostname;
+    const isTrusted = trustedDomains.some(domain =>
+        hostname === domain || hostname.endsWith('.' + domain)
+    );
+    if (isTrusted) {
         event.preventDefault();
         callback(true);
     } else {

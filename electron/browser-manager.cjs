@@ -768,6 +768,29 @@ class BrowserManager {
     }
 
     async navigate(provider, url) {
+        // Only allow navigation to known provider domains
+        const allowedDomains = {
+            perplexity: ['perplexity.ai'],
+            chatgpt: ['chat.openai.com', 'chatgpt.com', 'openai.com'],
+            claude: ['claude.ai'],
+            gemini: ['gemini.google.com']
+        };
+
+        try {
+            const parsed = new URL(url);
+            if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+                throw new Error(`Blocked: unsafe protocol ${parsed.protocol}`);
+            }
+            const domains = allowedDomains[provider] || [];
+            const isAllowed = domains.some(d => parsed.hostname === d || parsed.hostname.endsWith('.' + d));
+            if (!isAllowed) {
+                throw new Error(`Blocked: ${parsed.hostname} is not an allowed domain for ${provider}`);
+            }
+        } catch (e) {
+            console.error(`[Security] Navigate blocked: ${e.message}`);
+            throw e;
+        }
+
         const webContents = this.getWebContents(provider);
         if (!webContents) {
             this.createView(provider);

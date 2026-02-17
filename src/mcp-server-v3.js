@@ -14,6 +14,29 @@ const __dirname = path.dirname(__filename);
 
 const IPC_PORT = process.env.AGENT_HUB_PORT || 19222;
 
+// --- IPC Secret ---
+
+function readIPCSecret() {
+    // Read the IPC secret written by the Electron app
+    let secretPath;
+    if (process.platform === 'win32') {
+        secretPath = path.join(process.env.APPDATA || '', 'proxima', 'ipc-secret');
+    } else if (process.platform === 'darwin') {
+        secretPath = path.join(process.env.HOME || '', 'Library', 'Application Support', 'proxima', 'ipc-secret');
+    } else {
+        secretPath = path.join(process.env.HOME || '', '.config', 'proxima', 'ipc-secret');
+    }
+
+    try {
+        if (fs.existsSync(secretPath)) {
+            return fs.readFileSync(secretPath, 'utf8').trim();
+        }
+    } catch (e) {
+        console.error('[MCP] Could not read IPC secret:', e.message);
+    }
+    return process.env.PROXIMA_IPC_SECRET || null;
+}
+
 // --- IPC Client ---
 
 class IPCClient {
@@ -30,9 +53,28 @@ class IPCClient {
         if (this.connected) return true;
 
         return new Promise((resolve, reject) => {
-            this.socket = net.createConnection({ port: this.port, host: '127.0.0.1' }, () => {
+            this.socket = net.createConnection({ port: this.port, host: '127.0.0.1' }, async () => {
                 console.error('[MCP] Connected to Agent Hub');
                 this.connected = true;
+
+                // Authenticate with shared secret
+                const secret = readIPCSecret();
+                if (secret) {
+                    try {
+                        const authResult = await this.send('auth', null, {}, secret);
+                        if (!authResult.success) {
+                            console.error('[MCP] IPC authentication failed');
+                            reject(new Error('IPC authentication failed'));
+                            return;
+                        }
+                        console.error('[MCP] IPC authenticated successfully');
+                    } catch (e) {
+                        console.error('[MCP] IPC auth error:', e.message);
+                        reject(e);
+                        return;
+                    }
+                }
+
                 resolve(true);
             });
 
@@ -81,13 +123,14 @@ class IPCClient {
         }
     }
 
-    async send(action, provider = null, data = {}) {
-        if (!this.connected) {
+    async send(action, provider = null, data = {}, secret = undefined) {
+        if (!this.connected && action !== 'auth') {
             await this.connect();
         }
 
         const requestId = ++this.requestId;
         const request = { requestId, action, provider, data };
+        if (secret !== undefined) request.secret = secret;
 
         return new Promise((resolve, reject) => {
             this.pendingRequests.set(requestId, { resolve, reject });
@@ -166,6 +209,53 @@ function getFileReferenceEnabled() {
     return true; // Default enabled
 }
 
+// --- File path safety ---
+
+// Directories that should never be read by file tools
+const BLOCKED_PATHS = [
+    // Secrets & credentials
+    '.ssh', '.gnupg', '.gpg',
+    '.aws', '.azure', '.gcloud',
+    '.config/gcloud',
+    // Password stores
+    '.password-store', '.keys', '.secrets',
+    // Browser profiles (cookie theft)
+    '.mozilla', '.chrome', '.config/google-chrome', '.config/chromium',
+    'AppData/Local/Google/Chrome', 'AppData/Local/Mozilla',
+    // Environment files
+    '.env',
+];
+
+const BLOCKED_FILENAMES = [
+    '.env', '.env.local', '.env.production', '.env.development',
+    'id_rsa', 'id_ed25519', 'id_ecdsa', 'id_dsa',
+    'credentials', 'credentials.json', 'service-account.json',
+    'token.json', '.netrc', '.npmrc', '.pypirc',
+];
+
+function isPathSafe(filePath) {
+    if (!filePath) return false;
+    const resolved = path.resolve(filePath);
+    const normalized = resolved.replace(/\\/g, '/');
+    const basename = path.basename(resolved).toLowerCase();
+
+    // Block known sensitive filenames
+    if (BLOCKED_FILENAMES.includes(basename)) {
+        console.error(`[Security] Blocked read of sensitive file: ${basename}`);
+        return false;
+    }
+
+    // Block known sensitive directories
+    for (const blocked of BLOCKED_PATHS) {
+        if (normalized.includes(`/${blocked}/`) || normalized.includes(`/${blocked}`) || normalized.endsWith(`/${blocked}`)) {
+            console.error(`[Security] Blocked read from sensitive path: ${blocked}`);
+            return false;
+        }
+    }
+
+    return true;
+}
+
 // Read file contents and format for chat
 function readFileContents(filePaths) {
     if (!filePaths || filePaths.length === 0) return '';
@@ -178,6 +268,11 @@ function readFileContents(filePaths) {
 
     for (const filePath of filePaths) {
         try {
+            if (!isPathSafe(filePath)) {
+                contents.push(`[Blocked: ${path.basename(filePath)} is in a restricted path]`);
+                continue;
+            }
+
             if (!fs.existsSync(filePath)) {
                 contents.push(`[File not found: ${filePath}]`);
                 continue;
@@ -838,30 +933,18 @@ server.tool(
             const disabled = checkDisabled(useProvider);
             if (disabled) return disabled;
 
-            // Download image to temp file
-            const https = imageUrl.startsWith('https') ? require('https') : require('http');
-            const os = require('os');
-            const tmpDir = os.tmpdir();
+            // Download image to temp file using fetch (ESM-compatible)
+            const { tmpdir } = await import('os');
+            const tmpDir = tmpdir();
 
             const urlPath = new URL(imageUrl).pathname;
             const urlExt = path.extname(urlPath) || '.png';
             const tmpFile = path.join(tmpDir, `proxima_img_${Date.now()}${urlExt}`);
 
-            await new Promise((resolve, reject) => {
-                const file = fs.createWriteStream(tmpFile);
-                https.get(imageUrl, (response) => {
-                    if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
-                        const redirectModule = response.headers.location.startsWith('https') ? require('https') : require('http');
-                        redirectModule.get(response.headers.location, (res) => {
-                            res.pipe(file);
-                            file.on('finish', () => { file.close(); resolve(); });
-                        }).on('error', reject);
-                        return;
-                    }
-                    response.pipe(file);
-                    file.on('finish', () => { file.close(); resolve(); });
-                }).on('error', reject);
-            });
+            const response = await fetch(imageUrl, { redirect: 'follow' });
+            if (!response.ok) throw new Error(`Failed to download image: HTTP ${response.status}`);
+            const buffer = Buffer.from(await response.arrayBuffer());
+            fs.writeFileSync(tmpFile, buffer);
 
             console.error(`[analyze_image_url] Downloaded to: ${tmpFile}`);
 
@@ -1339,6 +1422,10 @@ server.tool(
     },
     async ({ filePath, question, provider }) => {
         try {
+            if (!isPathSafe(filePath)) {
+                return toolError(new Error(`Access denied: ${path.basename(filePath)} is in a restricted path`));
+            }
+
             const useProvider = provider || 'claude';
             const disabled = checkDisabled(useProvider);
             if (disabled) return disabled;
@@ -1397,6 +1484,10 @@ server.tool(
     },
     async ({ filePath, focus, provider }) => {
         try {
+            if (!isPathSafe(filePath)) {
+                return toolError(new Error(`Access denied: ${path.basename(filePath)} is in a restricted path`));
+            }
+
             const useProvider = provider || 'claude';
             const disabled = checkDisabled(useProvider);
             if (disabled) return disabled;
